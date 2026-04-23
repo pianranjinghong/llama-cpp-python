@@ -94,10 +94,19 @@ mtmd_context_p_ctypes = c_void_p
 mtmd_bitmap_p = NewType("mtmd_bitmap_p", int)
 mtmd_bitmap_p_ctypes = c_void_p
 
+# // position indexing for decoder model
+# enum mtmd_pos_type {
+#     MTMD_POS_TYPE_NORMAL, // number of positions equals to number of tokens
+#     MTMD_POS_TYPE_MROPE, // qwen-vl mrope style, each image takes max(t,h,w) position indexes
+# };
+class mtmd_pos_type(enum.IntEnum):
+    MTMD_POS_TYPE_NORMAL = 0  # number of positions equals to number of tokens
+    MTMD_POS_TYPE_MROPE  = 1  # qwen-vl mrope style, each image takes max(t,h,w) position indexes
+
 # struct mtmd_image_tokens {
 #     uint32_t nx; // number of tokens in x direction
 #     uint32_t ny; // number of tokens in y direction
-#     bool use_mrope_pos = false; // use M-RoPE position counting (the whole image is 1 temporal position)
+#     mtmd_pos_type pos = MTMD_POS_TYPE_NORMAL;
 #     uint32_t n_tokens() const { return nx * ny; }
 #     clip_image_f32_batch batch_f32; // preprocessed image patches
 #     std::string id; // optional user-defined ID, useful for KV cache tracking
@@ -269,28 +278,29 @@ def mtmd_free(ctx: mtmd_context_p):
     ...
 
 # // whether we need to set non-causal mask before llama_decode
-# MTMD_API bool mtmd_decode_use_non_causal(mtmd_context * ctx);
+# // if chunk is nullptr, we assume the default case where chunk is an image chunk
+# MTMD_API bool mtmd_decode_use_non_causal(const mtmd_context * ctx, const mtmd_input_chunk * chunk);
 @ctypes_function_mtmd(
-    "mtmd_decode_use_non_causal", [mtmd_context_p_ctypes], c_bool)
-def mtmd_decode_use_non_causal(ctx: mtmd_context_p) -> c_bool:
+    "mtmd_decode_use_non_causal", [mtmd_context_p_ctypes, mtmd_input_chunk_p_ctypes], c_bool)
+def mtmd_decode_use_non_causal(ctx: mtmd_context_p, chunk: mtmd_input_chunk_p) -> c_bool:
     ...
 
 # // whether the current model use M-RoPE for llama_decode
-# MTMD_API bool mtmd_decode_use_mrope(mtmd_context * ctx);
+# MTMD_API bool mtmd_decode_use_mrope(const mtmd_context * ctx);
 @ctypes_function_mtmd(
     "mtmd_decode_use_mrope", [mtmd_context_p_ctypes], c_bool)
 def mtmd_decode_use_mrope(ctx: mtmd_context_p) -> c_bool:
     ...
 
 # // whether the current model supports vision input
-# MTMD_API bool mtmd_support_vision(mtmd_context * ctx);
+# MTMD_API bool mtmd_support_vision(const mtmd_context * ctx);
 @ctypes_function_mtmd(
     "mtmd_support_vision", [mtmd_context_p_ctypes], c_bool)
 def mtmd_support_vision(ctx: mtmd_context_p) -> c_bool:
     ...
 
 # // whether the current model supports audio input
-# MTMD_API bool mtmd_support_audio(mtmd_context * ctx);
+# MTMD_API bool mtmd_support_audio(const mtmd_context * ctx);
 @ctypes_function_mtmd(
     "mtmd_support_audio", [mtmd_context_p_ctypes], c_bool)
 def mtmd_support_audio(ctx: mtmd_context_p) -> c_bool:
@@ -298,7 +308,7 @@ def mtmd_support_audio(ctx: mtmd_context_p) -> c_bool:
 
 # // get audio sample rate in Hz, for example 16000 for Whisper
 # // return -1 if audio is not supported
-# MTMD_API int mtmd_get_audio_sample_rate(mtmd_context * ctx);
+# MTMD_API int mtmd_get_audio_sample_rate(const mtmd_context * ctx);
 @ctypes_function_mtmd(
     "mtmd_get_audio_sample_rate", [mtmd_context_p_ctypes], c_int)
 def mtmd_get_audio_sample_rate(ctx: mtmd_context_p) -> c_int:
@@ -587,17 +597,17 @@ mtmd_decoder_pos_p_ctypes = c_void_p
 
 # // get position for decoder attention, to be used by M-RoPE models
 # // i is the index of the embedding token, ranging from 0 to mtmd_image_tokens_get_n_tokens() - 1
-# // return relative position (for example, embedding 0 will have position (0, 0, 0);
-# // remember to adjust it to the current absolute position)
-# MTMD_API struct mtmd_decoder_pos mtmd_image_tokens_get_decoder_pos(const mtmd_image_tokens * image_tokens, size_t i);
+# // pos_0 is the absolute position of the first token
+# // return relative position (for example, embedding 0 will have position (0, 0, 0); remember to adjust it to the current absolute position)
+# MTMD_API struct mtmd_decoder_pos mtmd_image_tokens_get_decoder_pos(const mtmd_image_tokens * image_tokens, llama_pos pos_0, size_t i);
 @ctypes_function_mtmd(
-    "mtmd_image_tokens_get_decoder_pos", [mtmd_image_tokens_p_ctypes, c_size_t], mtmd_decoder_pos)
-def mtmd_image_tokens_get_decoder_pos(image_tokens: mtmd_image_tokens_p, i: c_size_t) -> mtmd_decoder_pos:
+    "mtmd_image_tokens_get_decoder_pos", [mtmd_image_tokens_p_ctypes, c_int32, c_size_t], mtmd_decoder_pos)
+def mtmd_image_tokens_get_decoder_pos(image_tokens: mtmd_image_tokens_p, pos_0: c_int32, i: c_size_t) -> mtmd_decoder_pos:
     """
     get position for decoder attention, to be used by M-RoPE models
     i is the index of the embedding token, ranging from 0 to mtmd_image_tokens_get_n_tokens() - 1
-    return relative position (for example, embedding 0 will have position (0, 0, 0);
-    remember to adjust it to the current absolute position)
+    pos_0 is the absolute position of the first token
+    return relative position (for example, embedding 0 will have position (0, 0, 0); remember to adjust it to the current absolute position)
     """
     ...
 
@@ -815,14 +825,16 @@ def mtmd_helper_get_n_pos(chunks: mtmd_input_chunk_p) -> c_int32:
 
 # // helper to get the list of relative positions corresponding to the embedding tokens, to be used by M-RoPE
 # // out_pos must have length == mtmd_helper_get_n_tokens(image)
-# MTMD_API void mtmd_helper_image_get_decoder_pos(const mtmd_image_tokens * image, struct mtmd_decoder_pos * out_pos);
+# MTMD_API void mtmd_helper_image_get_decoder_pos(const mtmd_image_tokens * image, llama_pos pos_0, struct mtmd_decoder_pos * out_pos);
 @ctypes_function_mtmd("mtmd_helper_image_get_decoder_pos", [
                         mtmd_image_tokens_p_ctypes,
+                        c_int32,
                         mtmd_decoder_pos_p_ctypes
                     ],
                     None)
 def mtmd_helper_image_get_decoder_pos(
     image: mtmd_image_tokens_p,
+    pos_0: c_int32,
     out_pos: mtmd_decoder_pos_p # type: ignore
 ) -> c_int32:
     """
